@@ -6,6 +6,10 @@ from sys import maxsize
 import json
 from collections import defaultdict
 import numpy as np
+import heapq
+import random
+from copy import copy
+import random
 
 """
 Most of the algo code you write will be in this file unless you create new
@@ -19,6 +23,25 @@ Advanced strategy tips:
   board states. Though, we recommended making a copy of the map to preserve 
   the actual current map state.
 """
+
+    #* score priority:
+    # respawn 1.0 
+    # recycle 0.8
+    # enhance 0.5
+    # reinforce 0.3
+    # support mp/20 
+    
+        
+
+class Priority:
+    def __init__(self,wall=1, turret=1,support=1):
+        # priority for each unit
+        self.p ={
+            WALL : wall,
+            TURRET: turret,
+            SUPPORT: support
+        }
+
 
 class AlgoStrategy(gamelib.AlgoCore):
     def __init__(self):
@@ -63,7 +86,6 @@ class AlgoStrategy(gamelib.AlgoCore):
             INTERCEPTOR: config["unitInformation"][5]["cost"]
         }
 
-
         # stuff for enemy analysis
         self.first_frame_captured = False
         self.enemy_structure_prev = [[0] * WIDTH] * WIDTH
@@ -84,10 +106,88 @@ class AlgoStrategy(gamelib.AlgoCore):
         }
 
         ##Defenders
-        ##key: unit's shorthand, value: [locations, damage taken]
-        self.breached_defenders = defaultdict(list) 
-        # self.removed_defenders = defaultdict(list)
+        ##key: unit's shorthand, value: [locations]
+        self.owned_defenders = {
+            TURRET:[[3, 12], [8, 12], [19, 12], [24, 12], [13, 11], [14, 11]]
+            WALL: [[0, 13], [1,13],[2, 13], [3, 13], [8, 13], [19, 13], [24, 13], [25, 13], [26,13],[27, 13], [7, 12], [9, 12], [12, 12], [13, 12], [14, 12], [15, 12], [18, 12], [20, 12]]
+            SUPPORT:[]
+        }
+        
+        ##Defenders
+        ##key: unit's shorthand, value: [locations]
+        self.reinforcements = {
+            WALL: [[4, 13], [5, 13], [22, 13], [23, 13], [10, 12], [17, 12],[6, 12], [11, 12], [16, 12], [21, 12],[1, 12], [2, 12], [25, 12], [26, 12], [2, 11], [25, 11]]
+            TURRET: [[4, 12], [5, 12], [22, 12], [23, 12], [7, 11], [9, 11], [12, 11], [15, 11], [18, 11], [20, 11],[5, 11], [10, 11], [17, 11], [22, 11]]
+        }
 
+        ##Supports
+        ##key: support area, valueL [locations]
+        self.supports = {
+            "init":[[8, 11], [19, 11]],
+            "left_wing":[[3, 11], [4, 11]]
+            "right_wing":[[23, 11], [24, 11]]
+            "left_mid":[[7, 10], [8, 10], [9, 10], [10, 10]]
+            "mid":[[12, 10], [13, 10], [14, 10], [15, 10]]
+            "right_mid":[[17, 10], [18, 10], [19, 10], [20, 10]]
+        } 
+        self.support_areas = ["init", "left_wing", "right_wing","left_mid","mid", "right_mid"]
+        self.curr_support_area = self.support_areas[0]
+
+        # self.advance_reinforce = {
+        #     WALL:[[1, 12], [2, 12], [25, 12], [26, 12], [2, 11], [25, 11]]
+        #     TURRET:[[5, 11], [10, 11], [17, 11], [22, 11]]
+        #     SUPPORT: [[3, 11], [4, 11], [23, 11], [24, 11], [7, 10], [8, 10], [9, 10], [10, 10], [12, 10], [13, 10], [14, 10], [15, 10], [17, 10], [18, 10], [19, 10], [20, 10]]
+        # }
+        
+        global SPAWN, REMOVE, UPGRADE, NO_ACTION, NO_UNIT
+        SPAWN = "spawn"
+        REMOVE = "remove"
+        UPGRADE = "upgrade"
+        NO_ACTION = "no_action"
+        NO_UNIT = "no_unit"
+
+
+
+        # priority map and action map
+        self.priority_map = np.zeros((WIDTH,WIDTH))
+        self.action_map = [[(NO_ACTION, NO_UNIT)] * WIDTH for _ in range(WIDTH)]
+
+        self.recycled_units = []
+    
+        #* Action priorities
+        # priority for spawning hard-coded position
+        self.init_priority = Priority()
+        # priority for locking reserved opening position
+        self.lock_priority = Priority(-100)
+        # priority for re-pairing 
+        self.recycle_priority = Priority()
+        # priority for spawning
+        self.spawn_priority = Priority()
+        # priority for upgrade
+        self.enhance_priority = Priority()
+        # priority for reinfrocement
+        self.reinforce_priority = Priority()
+        #hold number of Mp to spawn 1 support
+        self.support_priority = 20
+
+        # Vulnerable range
+        global VULNERABLE_RANGE
+        VULNERABLE_RANGE = 2
+
+        # attacking strategy
+        self.ready_to_attack = False
+        self.attack_openings = [
+            [1, 13],
+            [6, 12],
+            [11, 12],
+            [16, 12],
+            [21, 12],
+            [25, 13]
+        ]
+        self.reserved_opening = []
+
+
+        
     def on_turn(self, turn_state):
         """
         This function is called every turn with the game state wrapper as
@@ -97,13 +197,19 @@ class AlgoStrategy(gamelib.AlgoCore):
         game engine.
         """
         game_state = gamelib.GameState(self.config, turn_state)
-        gamelib.debug_write('Performing turn {} of your custom algo strategy'.format(game_state.turn_number))
+        gamelib.debug_write('Performing turn {} of our strategy'.format(game_state.turn_number))
         game_state.suppress_warnings(True)  #Comment or remove this line to enable warnings.
-        ## place defense only on 1st turn
-        self.init_defense(game_state)
+        
+        ## spawn hard coded defense only on 1st turn
+        if game_state.turn_number < 1:
+            self.init_defense(game_state)
         self.defense_strategy(game_state)
         ## self.starter_strategy(game_state)
-
+        
+        # deploy mobile units
+        self.deploy_strategy(game_state)
+        
+        # submit strategy
         game_state.submit_turn()
 
         # reset enemy analysis flag
@@ -122,35 +228,6 @@ class AlgoStrategy(gamelib.AlgoCore):
         if not self.first_frame_captured:
             self.first_frame_captured = True
             self.analyze_enemy(state)
-        # Let's record at what position we get scored on
-        events = state["events"]
-        breaches = events["breach"]
-        damages = events["damages"]
-        defenders = {2:TURRET,0:WALL}
-        self.breached_defenders = defaultdict(list)
-        for breach in breaches:
-            location = breach[0]
-            unit_owner_self = True if breach[4] == 1 else False
-            unit_type = breach[2]
-            if unit_owner_self:
-                self.breached_defenders[defenders[unit_type]].append(location)
-            # When parsing the frame data directly, 
-            # 1 is integer for yourself, 2 is opponent (StarterKit code uses 0, 1 as player_index instead)
-            if not unit_owner_self:
-                gamelib.debug_write("Got scored on at: {}".format(location))
-                self.scored_on_locations.append(location)
-                gamelib.debug_write("All locations: {}".format(self.scored_on_locations))
-
-        ## get all damaged defenders
-        # self.damaged_defenders = {}
-        # defenders = {2:TURRET, 0:WALL}
-        # for damage in damages:
-        #     location = damage[0]
-        #     unit_owner_self = True if damage[4] == 1 else False
-        #     unit = damage[2]
-        #     damage_taken = damage[1]
-        #     if unit_owner_self and unit in defenders:
-        #         self.damaged_defenders[defenders[unit]].append((location, damage_taken))
 
     """
     ------------------------------------------Our code below:
@@ -190,11 +267,12 @@ class AlgoStrategy(gamelib.AlgoCore):
         norm_enemy_structure_heatmap = np.array(norm_enemy_structure_heatmap)    # (3x28x28)
         # filter out likely locations and sort by likelihood
         norm_enemy_structure_predict = np.argwhere(norm_enemy_structure_heatmap > possibility_bar)      # TODO: TUNABLE
-        order = np.argsort(norm_enemy_structure_heatmap[norm_enemy_structure_predict])                  # need to check if this map access is correct
+        order = np.argsort(-1 * norm_enemy_structure_heatmap[norm_enemy_structure_predict])                  # need to check if this map access is correct
         norm_enemy_structure_predict = norm_enemy_structure_predict[order]
+        gamelib.debug_write("Prediction on enemy structures: {}".format(norm_enemy_structure_predict))  # NOTE: for debugging
         # add likely positions to the map
-        for index, x_coord, y_coord in norm_enemy_structure_predict:
-            if len(game_state[x_coord][y_coord]) > 0:
+        for index, x_coord, y_coord in norm_enemy_structure_predict: 
+            if not game_state.can_spawn([WALL, SUPPORT, TURRET][index], [x_coord, y_coord], 1):
                 continue
             enemy_sp -= self.units_cost[unit_type]
             if enemy_sp < 0:
@@ -203,145 +281,745 @@ class AlgoStrategy(gamelib.AlgoCore):
         return predicted_game_state
 
     def predict_enemy_attack(self, game_state):
-        # Returns possible breach location
+        # Returns a list of possible breach locations with corresponding probabilities
+        # create normalized enemy deployment heatmap
         enemy_deploy_tensor = []
         enemy_deploy_num = []
         for unit_type in [WALL, SUPPORT, TURRET]:
             enemy_deploy_tensor.append(self.enemy_deploy_heatmap[unit_type])
             enemy_deploy_num.append(self.enemy_deploy_num[unit_type])
         enemy_deploy_tensor = np.linalg.norm(np.array(enemy_deploy_tensor))     # (3x28)
+        # filter out hot deploy locations and order by p
         enemy_deploy_location = np.argwhere(enemy_deploy_tensor > 0)                                    # TODO: TUNABLE
-        order = np.argsort(self.enemy_deploy_heatmap[enemy_deploy_location])
-        enemy_deploy_location = enemy_deploy_location[order]
+        #order = np.argsort(self.enemy_deploy_heatmap[enemy_deploy_location])
+        #enemy_deploy_location = enemy_deploy_location[order]
         result = []
         for index, x_coord in enemy_deploy_location:
-            coords = self.get_edge_location(27 - x_coord)
+            coords = self.get_edge_location(x_coord)
+            coords[1] = 27 - coords[1]  # flip Y-coordinate as it's on the enemy side
+            unit_type = [WALL, SUPPORT, TURRET][index]
+            if not game_state.can_spawn(unit_type, coords, 1): continue
             num_deployed = enemy_deploy_num[index][x_coord]
             num_mode = max(set(num_deployed), key = num_deployed.count)
-            simulation = self.single_attack_path_analysis(game_state, coords, num_mode, [WALL, SUPPORT, TURRET][index])
-            breach_pos = simulation[-1]
-            result.append(breach_pos, enemy_deploy_tensor[index, x_coord])
+            tmp_state = copy(game_state)
+            for i in range(num_mode):
+                tmp_state.game_map.add_unit(unit_type, coords, 1)
+            simulation = self.multi_attack_path_analysis(tmp_state, [coords])
+            crossing_pos = simulation[7][0]
+            breach_pos = simulation[6][0]
+            hp_damage = simulation[3][0]
+            if simulation[0] == 0:
+                continue
+            result.append([crossing_pos, breach_pos, enemy_deploy_tensor[index, x_coord] * hp_damage])
+        result = list(sorted(result, lambda x: -1 * x[2]))
+        gamelib.debug_write("Prediction on enemy attacks: {}".format(result))                           # NOTE: for debugging
         return result
     
-    def get_damged_defenders(self, game_state):
-        #key: unit type, value: health ratio
-        damaged_defenders = defaultdict(list)
+
+    def lock_reserved_opening(self, game_state, low_priority):
+        """
+            set reserved opening's priority to lowest as possible 
+        """
+        for x,y in self.reserved_opening:
+            self.priority_map[x][y] = low_priority
+            self.action_map[x][y]= (REMOVE,WALL)
+        self.reserved_opening = []
+        return 
+            
+    def get_destroyed_defenders(self, game_state):
+        """
+            respawn destroyed defenders
+            add spawn priority to priority map at x,y
+            updates self.owned_defender
+        """
+
+        for unit_type in [WALL, TURRET]:
+            for location in self.owned_defenders[unit_type]:
+                x,y = location
+                defender = game_state.game_map[location]
+                #check whether defender is out of map or not
+                if not defender:
+                    #update priority map
+                    self.priority_map[x][y] += self.spawn_priority.p[unit_type]
+                    self.action_map[x][y] = (SPAWN, unit_type)
+                    self.owned_defenders[unit_type].remove(location)
+        return
+    
+    def get_damaged_defenders(self, game_state):
+        """
+            recycle damaged defenders
+            add (recycle prioirty * health_ratio)  to priority map at x,y
+            add damaged defenders to recycled list to spawn in future turn
+        """
+        
         defenders = [TURRET, WALL]
-        for location in game_state.game_map:
+        for unit_type in defenders:
+            for location in self.owned_defenders[unit_type]:
+                defender = game_state.game_map[location]
+                health_ratio = defender.health / defender.max_health
+                # check whether unit is damaged
+                if health_ratio !== 1:
+                    self.priority_map[x][y] += health_ratio * self.recycle_priority.p[unit_type]
+                    self.action_map[x][y] = (REMOVE,unit_type)
+                    self.recycled_units.append((location,unit_type))
+
+        return
+
+    def add_recycled_units(self, game_state):
+        """
+            add spawn priority to priority map, where x,y is the location recycled unit from previous turn
+        """
+        defenders = [WALL,TURRET]
+
+        for location, unit_type in self.recycled_units:
+            #check whether location in game map is occupied or not
+            x,y = location
             unit = game_state.game_map[location]
-            unit_owned = unit.player_index
-            if unit_owned and unit.unit_type in defenders:
-                health_ratio = unit.health / unit.max_health
-                damaged_defenders[unit.unit_type].append((location, health_ratio))
-        return damaged_defenders
-    
-    # upgrade defenders
-    def upgrade_denfense(self, game_state, damaged_defenders, unit_type, threshold):
-        for locaiton, health_ratio in damaged_defenders[unit_type]:
-            if health_ratio > threshold:
-                game_state.attempt_upgrade(location)
-    
-    def recycle_defenders(self, game_state, damaged_defenders, unit_type, threshold):
-        for locaiton, health_ratio in damaged_defenders[TURRET]:
-            if health_ratio > threshold:
-                game_state.attempt_remove(location)
+            # if the current location is not occupied
+            if not unit:
+                self.priority_map[x][y] += self.spawn_priority.p[defender]
+                self.action_map[x][y] = (SPAWN,unit_type)
+            else:
+                gamelib.debug_write("Something went wrong, recycled unit's location shouldn't be occupied") 
+        return
+
+    def get_unit_within_area(self, area, defenders,unit_type,):
+        """
+            filter out units, whose location is within the area
+        """
+        return filter(lambda x: x in area, defenders[unit_type])
         
-    def respawn_defenders(self, game_state, breached_defenders, unit_type, threshold):
-        temp = sorted(self.breached_defenders[unit_type], key=lambda: x[0])
-        for location in temp:
-            
-            
+    def enhance_vulnerable_area(self, game_state,vulnerable_locations, threateness):
+        """
+            enhance either vulnerable corners or vulnerable centre
+        """
+        defenders = [TURRET,WALL]
+        vulnerable_area = game_state.game_map.get_locations_in_range(vulnerable_locations, VULNERABLE_RANGE)
+        for unit_type in defenders:
+            # extra all owned defenders within the area
+            locations = self.get_unit_within_area(vulnerable_area, self.owned_defenders,unit_type)
+            for location in locations:
+                x,y = location
+                defender = game_state.game_map[location]
+                #make sure defender is not null
+                if defender:
+                    health_ratio = defender.health / defender.max_health
+                    #only enhance undamaged defender
+                    if health_ratio == 1:
+                        self.priority_map[x][y] += threateness
+        return 
+        
+    def enhance_defenders(self, game_state,vulnerables):
+        """
+            add enhance priority to priority map based on vulnerability
+        """
+        defenders = [WALL,TURRET]
+
+        for unit_type in defenders:
+            for location in self.owned_defenders[unit_type]:
+                x,y = location
+                defender = game_state.game_map[location]
+                # check existence of defender and is in full health
+                if defender:
+                    health_ratio = defender.health / defender.max_health
+                    if health_ratio == 1:
+                        self.priority_map[x][y] += self.enhance_priority[unit_type]
+                        self.action_map[x][y] = (UPGRADE,unit_type)
+
+        # add vulnerability/threatheness to priority
+        # assume location is where enemy first crosses our board        
+        for crossing,breach_locations,threateness in vulnerables:
+            #find vulnerable area for breaching corners
+            self.enhance_vulnerable_area(game_state, breach_locations, threateness)
+            # find vulnerable area for crossing
+            self.enhance_vulnerable_area(game_state,crossing, threateness)     
+        return
+
+    def reinforce_vulnerable_area(self, game_state, vulnerable_locations,threateness):
+        """
+            reinforce either vulnerable corners or vulnerable centre
+        """
+        defenders = [TURRET,WALL]
+        vulnerable_area = game_state.game_map.get_locations_in_range(vulnerable_locations, VULNERABLE_RANGE)
+        for unit_type in defenders:
+            # extra all owned defenders within the area
+            locations = self.get_unit_within_area(vulnerable_area, self.reinforcements,unit_type)
+            for location in locations:
+                x,y = location
+                unit = game_state.game_map[location]
+                #if there's no unit, place reinforcement
+                if not unit:
+                    self.priority_map[x][y] += threateness
+        return
 
 
+    def reinforce_defenders(self, game_state, vulnerables):
+        """
+            add reinforce priority to defenders based on vulnerability
+        """
+        defenders = [WALL,TURRET]
+        for unit_type in defenders:
+            for location in self.reinforcements[unit_type]:
+                defender = game_state.game_map[location]
+                #make sure location is not occupied
+                if not defender:
+                    x,y = location
+                    self.priority_map[x][y] += self.reinforce_priority.p[unit_type]
+                    self.action_map[x][y] = (SPAWN,unit_type)
 
-    ## TODO 
+        # assume location is where enemy first crosses our board        
+        for crossing,breach_locations, threateness in vulnerables:
+            #find vulnerable area for breaching corners
+            self.reinforce_vulnerable_area(self, game_state, breach_locations,threateness)
+            # find vulnerable area for crossing
+            self.reinforce_vulnerable_area(self, game_state, crossing,threateness)
+        return
+
+    def spawn_support_area(self,game_state, mp, area):
+        """
+            spawn support based on area and mp
+            return True if support added to priority map successfully
+        """
+
+        remaining_supports = len(self.supports[area]])
+        if remaining_supports == 0:
+            gamelib.debug_write("Support area is full, cannot spawn no more supports.") 
+            self.support_areas.remove(area)
+            return
+
+        if self.curr_support_area == area:
+            random_support = random.randint(0, remaining_supports-1)
+            location = self.supports[area][random_support]
+            self.supports[area].remove(location)
+            x,y = location
+            unit = game_state.game_map[location]
+            #check whether location is occupied
+            if not unit:
+                self.priority_map[x][y] += mp/self.support_priority
+                self.action_map[x][y] = (SPAWN, SUPPORT)
+            else:
+                gamelib.debug_write("Spawing supports in occupied position.") 
+        else:
+            gamelib.debug_write("Spawing in wrong support area.") 
+
+        return 
+
+    def spawn_support(self):
+        """
+            spawn support based on current MP
+        """
+        mp = game_state.MP
+        # check whether the current support area is full or not
+        remaining_supports = len(self.supports[self.curr_support_area]])
+        if remaining_supports == 0:
+            self.support_areas.remove(area)
+
+        #spawn init support first
+        # if current support area is fully spawned, select a different area to spawn
+        # select random support area, left_wing, right_wing, left_mid, right_mid, mid
+        self.curr_support_area = self.support_areas[random.randint(0, len(self.supports)-1)]
+        self.spawn_support_area(self, mp, area):
+        return
+    
+    def perform_actions(self,game_state, ordered_p_map):
+        """
+            Assume ordered_p_map is sorted in highest priority order
+            perform top priority actions
+            cases to handle when spawning
+                1. remove recycled location in recycled list if spawning location in recycled list
+                2. updates self.owned_defenders
+
+            cases to handle when removing:
+                1. updates self.owned_defender
+        """
+
+        current_SP = game_state.SP
+        i = 0 # ith action
+        while current_SP > 0:
+            location = ordered_p_map[i]
+            x,y = location
+            #extract action corresponds to x,y
+            action, unit_type= self.action_map[x][y]
+            if action == SPAWN:
+                success = game_state.attempt_spawn(unit_type, location)
+                if success > 0:
+                    current_SP -= game_state.type_cost(unit_type)
+                    #update self.owned_defenders
+                    self.owned_defenders[unit_type].append(location)
+                    # update recycled units
+                    if location in self.recycled_units:
+                        self.recycled_units.remove((location, unit_type))
+                else:
+                    gamelib.debug_write("Spawning object:{} failed".format(unit_type))  
+            elif action == UPGRADE:
+                    success = game_state.attempt_upgrade(location)
+                    if success > 0:
+                        current_SP -= game_state.type_cost(unit_type, True)
+                    else:
+                        gamelib.debug_write("Upgrading non existence object:{}".format(unit_type))  
+            elif action == REMOVE:
+                success = game_state.attempt_remove(location)
+                if success > 0:
+                    #update self.owned_defenders
+                    self.owned_defenders[unit_type].remove(location)
+                else:
+                    gamelib.debug_write("Removing non existence object:{}".format(unit_type))  
+            i+=1            
+        return
+        
+    ## TODO RT
+    def init_defense(self, game_state):
+        """ 
+            spawn defenders only on 1st turn and initializes priority map
+        """
+        ## attempt to spawn turrets
+        success = game_state.attempt_spawn(self.owned_defenders[TURRET])
+        if not success:
+            gamelib.debug_write("Forming turrets failed")
+
+        ## attempt to spawn walls
+        success =game_state.attempt_spawn(self.owned_defenders[WALL])
+        if not success:
+            gamelib.debug_write("Forming walls failed")
+        
+        return 
+
     def defense_strategy(self, game_state): 
-        # get all damaged defenders
-        damaged_defenders = self.get_damged_defenders(self, game_state)
+        # TODO 1. re-init priority map
+        #       1.1 set reserved opening to -100 and clear self.reserved_opening
+        #       1.2  get all destroyed defenders,
+        #       1.3 spawn recycled defenders
+        #       1.4 recycle damaged defenders  * depends on health ratio
+        #       1.5 enhance defenders ,depends on health ratio and vulnerability
+        #       1.6 spawn reinforcement, depends on vulnerability
+        #       1.7 spawn support, depends on vulnerablity
+        #TODO 2. sort priority in descending order
+        #      2.1 perform actions
+
+        #init priority map
+        for unit_type in [WALL,TURRET, SUPPORT]:
+            for location in self.owned_defenders[unit_type]:
+                x,y = location
+                self.priority_map[x][y] = self.init_priority.p[unit_type]
+                # already spawned
+                self.action_map[x][y] = (NO_ACTION,unit_type)  #! what action 2 perform
+        
+        vulnerables = self.predict_enemy_attack()
+        
+        #*1.1 lock revered opening 
+        self.lock_reserved_opening(game_state, self.lock_priority.p[WALL]):
+        
+        #*1.2 re-spawn destroyed defenders
+        self.get_destroyed_defenders(game_state)
+        
+        #*1.3 spawn recycled units from previous turn
+        self.add_recycled_units(game_state)
     
-        # priorities:
-        # 1. re-spawn breached defenders
+        #*1.4 get all damaged defenders
+        self.get_damaged_defenders(game_state)
         
-        # 2. upgrade possible breach corners
-        for location in self.predict_enemy_attack:
-            game_state.attempt_upgrade(location)
+        #*1.5 upgrade/enhance defenders
+        self.enhance_defenders(game_state,vulnerables)
         
-        # 3. recycle damaged turrets, whose health in within a threshold
-        health_threshold = 0.8
-        self.recycle_defenders(game_state, damaged_defenders, TURRET, health_threshold)
-        self.upgrade_denfense(game_state, damaged_defenders, TURRET, health_threshold)
+        #*1.6 reinforcement
+        self.reinforce_defenders(game_state, vulnerable)
+        
+        #*1.7  spawn supports
+        self.spawn_support(game_state)
+
+        #*2 sort priority map
+        ordered_p_map = np.argsort(-1 * self.priority_map)
+        
+        #*2.2 perform operations
+        self.perform_actions(game_state, ordered_p_map
+
+        return 
+
+    def deploy_strategy(self, game_state):
+        # attacking strategy
+        min_mp = 10                                                                         # TODO: Tunable
+        max_mp = 20
+        cur_mp = game_state.get_resource(1, 0)
+        # do not deploy if mp < min_mp
+        if cur_mp < min_mp and not self.ready_to_attack:
+            return
+        # may choose not to deploy based on current mp
+        if cur_mp / max_mp < random.random() and not self.ready_to_attack:
+            return
+        # if decide to deploy, check if we need to create an opening
+        no_opening = True
+        for x_coord, y_coord in self.attack_openings:
+            if len(game_state.game_map[x_coord][y_coord]) == 0:
+                no_opening = False
+                break
+        opening_location = [-1, -1]
+        if no_opening:
+            opening_location = self.attack_openings
+        # always use all mp
+        possible_deploy = []
+        for demolisher_num in range(mp // self.units_cost[DEMOLISHER]):
+            scout_num = (mp - demolisher_num * self.units_cost[DEMOLISHER]) // self.units_cost[SCOUT]
+            possible_deploy.append(scout_num, demolisher_num)
+        # compute best opportunity
+        best_opportunity_pts = (-1, [-1, -1], -1. -1. -1, -1)         # (value, opening, scout_x, demolisher_x, scout_num, demolisher_num)
+        best_opportunity_dmg = (-1, [-1, -1], -1. -1. -1, -1)         # (value, opening, scout_x, demolisher_x, scout_num, demolisher_num)
+        best_opportunity = (-1, [-1, -1], -1, -1. -1. -1)             # (value, opening, scout_x, demolisher_x, scout_num, demolisher_num)
+        for opening in opening_location:
+            sim_state = copy(game_state)
+            if opening[0] != -1:
+                sim_state.game_map.remove_unit(opening)
+            for scout_x in range(28):
+                scout_location = self.get_edge_location(scout_x)
+                if not sim_state.can_spawn(SCOUT, scout_location, 1): continue
+                for demolisher_x in range(28):
+                    demolisher_location = self.get_edge_location(demolisher_x)
+                    if not sim_state.can_spawn(DEMOLISHER, demolisher_location, 1) or demolisher_x == scout_x: continue
+                    for scout_num, demolisher_num in possible_deploy:
+                        tmp_state = copy(sim_state)
+                        for i in range(scout_num):
+                            tmp_state.game_map.add_unit(SCOUT, scout_location, 0)
+                        for i in range(demolisher_num):
+                            tmp_state.game_map.add_unit(DEMOLISHER, demolisher_location, 0)
+                        simulation = self.multi_attack_path_analysis(self, tmp_state, [scout_location, demolisher_location])
+                        points = sum(simulation[3])
+                        damage = sum(simulation[2])
+                        if points > best_opportunity_pts[0]:
+                            best_opportunity_pts = [points, opening, scout_x, demolisher_x, scout_num, demolisher_num]
+                        if damage > best_opportunity_dmg[0]:
+                            best_opportunity_dmg = [damage, opening, scout_x, demolisher_x, scout_num, demolisher_num]
+        # choose points-first or damage-first
+        if best_opportunity_pts[0] < 4:                                                     # TODO: Tunable
+            best_opportunity = best_opportunity_dmg
+        elif best_opportunity_dmg[0] < 200:
+            best_opportunity = best_opportunity_pts
+        elif best_opportunity_pts[0] * 50 > best_opportunity_dmg[0]:
+            best_opportunity = best_opportunity_pts
+        else:
+            best_opportunity = best_opportunity_dmg
+        # if no opening, create one and deploy next turn
+        if no_opening:
+            self.reserved_opening = best_opportunity[1]
+            game_state.attempt_remove(self.reserved_opening)
+            self.ready_to_attack = True
+            return
+        # if has opening, spawn units
+        gamelib.debug_write("Best deployment strategy: {}".format(best_opportunity))        # NOTE: for debugging
+        game_state.attempt_spawn(DEMOLISHER, self.get_edge_location(best_opportunity[2]), best_opportunity[4])
+        game_state.attempt_spawn(SCOUT, self.get_edge_location(best_opportunity[1]), best_opportunity[3])
+        self.ready_to_attack = False
+
+    ## RW  REFERENCE  single path, single unit type, finished
+    # def single_attack_path_analysis(self, game_state, location, num, unit):
+    #     # For each deployment position, try to investigate the attack path and potential result 
+    #     # based on the current friendly board and analyzed/predicted enemy board.
+    #     # return (can_reach, structure_demolished, damage_dealt, points_gain, first_attack_pos, breach_pos)
+    #     can_reach = 0
+    #     _dem_ = 0
+    #     _dmg_ = 0
+    #     _pnt_ = 0
+    #     _loss_ = 0
+    #     # add all normal supports into a set from game_state
+    #     normal_supp_set = set()
+    #     upgrade_supp_set = set()
+
+    #     for i in range(14):
+    #         for j in range(13-i, 13+i+1):
+    #             if game_state.map[j][i][0].unit_type == SUPPORT:
+    #                 if game_state.map[j][i][0].upgraded == 0:
+    #                     supp_set.add((game_state.map[j][i][0].x, game_state.map[j][i][0].y))
+    #                 else:
+    #                     upgrade_supp_set.add((game_state.map[j][i][0].x, game_state.map[j][i][0].y))
+
+    #     target_edge = get_target_edge(location)
+    #     path = find_path_to_edge(location, target_edge)
+    #     ind = 0
+    #     dmg_flag = 0
+    #     first_attack_pos = [-1,-1]
+
+    #     # initialize the total health of the deployment, and accommodate the path by the speed of the unit.unit_type (in frame count)
+    #     _hp_ = 0
+    #     adj_path = []
+    #     if unit.unit_type == SCOUT:
+    #         _hp_ = num * 15
+    #     elif unit.unit_type == DEMOLISHER:
+    #         _hp_ = num * 5
+    #         for cord in path:
+    #             for i in range(2):
+    #                 adj_path.append(cord)
+    #     else:
+    #         _hp_ = num * 40
+    #         for cord in path:
+    #             for i in range(4):
+    #                 adj_path.append(cord)
+
+    #     # analyze the coordinate one by one in the adjusted path (in frame manner), and at least one mobile unit exist
+    #     while (ind < len(adj_path) and num > 0):
+    #         cur_pos = adj_path[ind] # current coordinate
+
+    #         # Step 0: check if we reach the target edge
+    #         edge_locations = get_edge_locations(target_edge)
+    #         if cur_pos in edge_locations:
+    #             can_reach = 1
+    #             _pnt_ = num
+    #             break
+
+    #         # Step 1: Add shields through nearby supports
+    #         # normal support
+    #         for nss in normal_supp_set:
+    #             if nss.shieldRange > euclid_dist(nss, cur_pos):
+    #                 _hp_ += 3 * num
+    #                 normal_supp_set.remove(nss)
+    #         # upgraded support
+    #         for uss in upgrade_supp_set:
+    #             if uss.shieldRange > euclid_dist(uss, cur_pos):
+    #                 _hp_ += (4 + 0.3 * uss[1]) * num
+    #                 normal_supp_set.remove(nss)
+
+    #         single_unit_health = _hp_ / num # used in following code
+            
+    #         # Step 2: in each frame, calculate the destruction/damage that mobile units deal, and loss/health_loss of our units
+    #         # Step 2.1: 淦伤害
+    #         target_unit = get_target(unit)
+    #         if target_unit != None:
+    #             # get first attack position
+    #             if dmg_flag == 0:
+    #                 first_attack_pos = adj_path[ind]
+    #                 dmg_flag = 1
+    #             # 塔太tm硬了，没拆掉，只造成伤害
+    #             if target_unit.health > num * unit.damage_f:
+    #                 target_unit.health -= num * unit.damage_f
+    #                 _dmg_ += num * unit.damage_f
+    #             # 塔太虚了被淦掉了，但只能淦一个目标，不再需要while loop了。期间还要重新规划路径，更新gameboard
+    #             else:
+    #                 _dmg_ += target_unit.health
+    #                 game_state.game_map[target_unit.x][target_unit.y].pop(0)
+    #                 # 规划新路径
+    #                 new_location = [unit.x, unit.y]
+    #                 new_path = find_path_to_edge(new_location, target_edge)
+    #                 adj_path = adj_path[:ind] + new_path[1:]
+            
+    #         # Step 2.2: 承受伤害
+    #         attacking_units = get_attackers([unit.x, unit.y], 1)
+    #         if len(attacking_units) > 0:
+    #             # Stack total damage
+    #             dmg_taking = 0
+    #             for turret in attacking_units:
+    #                 dmg_taking += turret.damage_i
+    #             # calculate our loss
+    #             next_rest_hp = _hp_ % single_unit_health
+    #             # 伤害溢出，打头的mobile unit被淦掉了
+    #             if next_rest_hp <= dmg_taking:
+    #                 num -= 1
+    #                 _loss_ += 1
+    #                 _hp_ = num * single_unit_health
+    #             else:
+    #                 _hp_ -= dmg_taking
+
+    #         # Step 3: Update everything
+    #         ind += 1
+    #         if ind < len(adj_path):
+    #             unit.x = adj_path[ind][0]
+    #             unit.y = adj_path[ind][1]
         
 
-        # 4. upgrade turrets
+    #     # While loop is over
+    #     breach_pos = [-1, -1]
+    #     if can_reach == 1:
+    #         breach_pos = adj_path[-1]
         
         
-        # 5. recycle damaged turrets, whose health in within a threshold
-        for locaiton, health_ratio in damaged_defenders[WALL]:
-            if health_ratio > health_threshold:
-                game_state.attempt_remove(location)
-          
-
-        return shit
+    #     return can_reach, _dem_, _dmg_, _pnt_, _loss_, first_attack_pos, breach_pos
 
 
-    ## RW TODO
-    def single_attack_path_analysis(self, game_state, location, num, unittype):
-        # For each deployment position, try to investigate the attack path and potential result 
+    ## RW TODO DEBUG multiple paths, multiple unit types
+    def multi_attack_path_analysis(self, game_state, locations):
+        # For each deployment position, try to investigate the attack path and potential result
+        # The investigation is simultaneous and concurrent frane by frame
         # based on the current friendly board and analyzed/predicted enemy board.
-        # return (can_reach, structure_demolished, damage_dealt, points_gain, first_attach_pos, breach_pos)
-        can_reach = 0
+        # locations is the list of deploy locations, nums is the list of deployment numbers, units is the list of units
+        # return (can_reach, structure_demolished, damage_dealt, points_gain, damage_taken, first_attack_pos, breach_pos, cross_pos)
+        nums = []
+        units = []
+        for coord in locations:
+            scout_acm_num = 0
+            dem_acm_num = 0
+            inter_acm_num = 0
+            scout_pos = -1
+            dem_pos = -1
+            inter_pos = -1
+            for i, un in enumerate(game_state.game_map[coord[0]][coord[1]]):
+                if un.unit_type = SCOUT:
+                    scout_acm_num += 1
+                    scout_pos = i
+                elif un.unit_type = DEMOLISHER:
+                    dem_acm_num += 1
+                    dem_pos = i
+                else:
+                    inter_acm_num += 1
+                    inter_pos = i
+            if scout_acm_num > 0:
+                nums.append(scout_acm_num)
+                units.append(game_state.game_map[coord[0]][coord[1]][scout_pos])
+            if dem_acm_num > 0:
+                nums.append(dem_acm_num)
+                units.append(game_state.game_map[coord[0]][coord[1]][dem_pos])
+            if inter_acm_num > 0:
+                nums.append(inter_acm_num)
+                units.append(game_state.game_map[coord[0]][coord[1]][inter_pos])
+        
+        gamelib.debug_write("number of different units deployed: {}".format(len(units))
+        gamelib.debug_write("number of deployment units: {}".format(len(nums)))
+                
         _dem_ = 0
         _dmg_ = 0
         _pnt_ = 0
+        _loss_ = 0
+        breach_pos = [[-1,-1]] * len(nums)
+        first_attack_pos = [[-1,-1]] * len(nums)
+        cross_bd_pos = [[-1,-1]] * len(nums)
+
         # add all normal supports into a set from game_state
         normal_supp_set = set()
         upgrade_supp_set = set()
+
         for i in range(14):
             for j in range(13-i, 13+i+1):
-                if game_state.map[j][i][0].unit_type == SUPPORT:
-                    if game_state.map[j][i][0].upgraded == 0:
-                        supp_set.add((game_state.map[j][i][0].x, game_state.map[j][i][0].y))
+                if game_state.game_map[j][i][0].unit_type == SUPPORT:
+                    if game_state.game_map[j][i][0].upgraded == 0:
+                        normal_supp_set.add((game_state.game_map[j][i][0].x, game_state.game_map[j][i][0].y))
                     else:
-                        upgrade_supp_set.add((game_state.map[j][i][0].x, game_state.map[j][i][0].y))
-
-        target_edge = get_target_edge(location)
-        path = find_path_to_edge(location, edge)
-        ind = 0
-
-        # initialize the total health of the deployment, and accommodate the path by the speed of the unittype (in frame count)
-        _hp_ = 0
-        adj_path = []
-        if unittype == SCOUT:
-            _hp_ = num * 15
-        elif unittype == DEMOLISHER:
-            _hp_ = num * 5
-            for cord in path:
-                for i in range(2):
-                    adj_path.append(cord)
-        else:
-            _hp_ = num * 40
-            for cord in path:
-                for i in range(4):
-                    adj_path.append(cord)
-                    
-        # analyze the coordinate one by one in the adjusted path (in frame count)
-        while ind < len(path):
-            cur_pos = path[ind] # current coordinate
-
-            # Step 1: Add shields through nearby supports
-            # normal support
-            for nss in normal_supp_set:
-                if nss.shieldRange > euclid_dist(nss, cur_pos):
-                    _hp_ += 3 * num
-                    normal_supp_set.remove(nss)
-            # upgraded support
-            for uss in upgrade_supp_set:
-                if uss.shieldRange > euclid_dist(uss, cur_pos):
-                    _hp_ += (4 + 0.3 * uss[1]) * num
-                    normal_supp_set.remove(nss)
-            
-            # Step 2: in each frame, calculate the damage we dealt to 
+                        upgrade_supp_set.add((game_state.game_map[j][i][0].x, game_state.game_map[j][i][0].y))
         
+        target_edges = []
+        for loc in locations:
+            target_edges.append(game_state.get_target_edge(loc))
+        paths = []
+        for i in range(len(units)):
+            paths.append(game_state.find_path_to_edge(locations[i], target_edges[i]))
+        
+        adj_paths = []
+        for i in range(len(units)):
+            adj_path = []
+            if units[i].unit_type == SCOUT:
+                adj_paths.append(paths[i])
+            elif units[i].unit_type == DEMOLISHER:
+                for cord in paths[i]:
+                    for j in range(2):
+                        adj_path.append(cord)
+                adj_paths.append(adj_path)
+            else:
+                for cord in paths[i]:
+                    for i in range(4):
+                        adj_path.append(cord)
+                adj_paths.append(adj_path)
+
+        
+        list_normal_supp_set = []
+        list_upgrade_supp_set = []
+        for i in range(len(adj_paths)):
+            list_normal_supp_set.append(normal_supp_set)
+            list_upgrade_supp_set.append(upgrade_supp_set)
+        
+        total_num = sum(nums)
+        ind = 0
+        dmg_flag = [0] * len(units)
+        full_health = [0] * len(units)
+        # analyze the coordinate one by one in the adjusted path (in frame manner), and at least one mobile unit exist
+        while (total_num > 0):
+            update_SP = {}
+            
+            for i, adj_path in enumerate(adj_paths):
+                # This path has been exhausted
+                if ind >= len(adj_paths):
+                    continue
+                
+                cur_pos = adj_path[ind] # current coordinate
+                if cur_pos[1] == 14:
+                    cross_bd_pos[i] = cur_pos
+
+                # Step 0: check if we reach the target edge
+                edge_locations = game_state.game_map.get_edge_locations(target_edge)
+                if cur_pos in edge_locations:
+                    can_reach = 1
+                    breach_pos[i] = cur_pos
+                    _pnt_ += nums[i]
+                    continue
+
+                # Step 1: Add shields through nearby supports
+                # normal support
+                for nss in normal_supp_set:
+                    if nss.shieldRange > euclid_dist(nss, cur_pos):
+                        units[i].health += 3
+                        list_normal_supp_set[i].remove(nss)
+                # upgraded support
+                for uss in upgrade_supp_set:
+                    if uss.shieldRange > euclid_dist(uss, cur_pos):
+                        units[i].health += 4 + 0.3 * uss[1]
+                        list_normal_supp_set[i].remove(nss)
+                        
+                if full_health[i] < units[i].health:
+                    full_health[i] = units[i].health
+                # Step 2: in each frame, calculate the destruction/damage that mobile units deal, and loss/health_loss of our units
+                # Step 2.1: 淦伤害
+                target_unit = game_state.get_target(units[i])
+                if target_unit != None:
+                    # get first attack position
+                    if dmg_flag[i] == 0:
+                        first_attack_pos[i] = adj_path[ind]
+                        dmg_flag[i] = 1
+                    # 计算该单位对 target 的伤害, 记录伤害，之后update game_state，update path
+                    if [target_unit.x, target_unit.y] in update_SP:
+                        update_SP[[target_unit.x, target_unit.y]] += units[i].damage_f * nums[i]
+                    else:
+                        update_SP[[target_unit.x, target_unit.y]] = units[i].damage_f * nums[i]
+            
+                # Step 2.2: 承受伤害
+                attacking_units = game_state.get_attackers([units[i].x, units[i].y], 1)
+                if len(attacking_units) > 0:
+                    # Stack total damage
+                    dmg_taking = 0
+                    for turret in attacking_units:
+                        dmg_taking += turret.damage_i
+                    # 伤害溢出，打头的mobile unit被淦掉了
+                    if units[i].health <= dmg_taking:
+                        nums[i] -= 1
+                        total_num -= 1
+                        _loss_ += 1
+                        # 刷新，下一个 mobile unit 出现
+                        units[i].health = full_health[i]
+                    # 伤害没益处，扣掉现在打头mobile unit的血量
+                    else:
+                        units[i].health -= dmg_taking
+            
+            # For loop is over
+            # First update the game_state
+            for loc in update_SP:
+                if game_state.game_map[loc[0]][loc[1]][0].health > update_SP[loc]:
+                    game_state.game_map[loc[0]][loc[1]][0].health -= update_SP[loc]
+                    _dmg_ += update_SP[loc]
+                else:
+                    _dmg_ += game_state.game_map[loc[0]][loc[1]][0].health
+                    game_state.game_map[loc[0]][loc[1]][0] = []
+                    _dem_ += 1
+            # Then update the adj_paths
+            for i, path in enumerate(adj_paths):
+                if ind >= len(path):
+                    continue
+                temp_path = game_state.find_path_to_edge([units[i].x, units[i].y], target_edges[i])
+                adj_paths[i] = adj_paths[i][:ind] + temp_path[ind:]
+            # Then update the unit location
+            for i, unit in enumerate(units):
+                units[i].x = adj_paths[i][ind+1][0]
+                units[i].y = adj_paths[i][ind+1][1]
+            # Finally, update the ind to ind+1
+            ind += 1
+            
+        # While loop is over
+        
+        
+        return can_reach, _dem_, _dmg_, _pnt_, _loss_, first_attack_pos, breach_pos, cross_bd_pos
+        
+
     """
     ----------------------------helper functions----------------------------
     """
@@ -357,157 +1035,3 @@ class AlgoStrategy(gamelib.AlgoCore):
 if __name__ == "__main__":
     algo = AlgoStrategy()
     algo.start()
-
-
-
-class Old:
-        """
-    NOTE: All the methods after this point are part of the sample starter-algo
-    strategy and can safely be replaced for your custom algo.
-    """
-    def starter_strategy(self, game_state):
-        """
-        For defense we will use a spread out layout and some interceptors early on.
-        We will place turrets near locations the opponent managed to score on.
-        For offense we will use long range demolishers if they place stationary units near the enemy's front.
-        If there are no stationary units to attack in the front, we will send Scouts to try and score quickly.
-        """
-        # First, place basic defenses
-        # self.build_defences(game_state)
-        # Now build reactive defenses based on where the enemy scored
-        self.build_reactive_defense(game_state)
-
-        # If the turn is less than 5, stall with interceptors and wait to see enemy's base
-        if game_state.turn_number < 5:
-            self.stall_with_interceptors(game_state)
-        else:
-            # Now let's analyze the enemy base to see where their defenses are concentrated.
-            # If they have many units in the front we can build a line for our demolishers to attack them at long range.
-            if self.detect_enemy_unit(game_state, unit_type=None, valid_x=None, valid_y=[14, 15]) > 10:
-                self.demolisher_line_strategy(game_state)
-            else:
-                # They don't have many units in the front so lets figure out their least defended area and send Scouts there.
-
-                # Only spawn Scouts every other turn
-                # Sending more at once is better since attacks can only hit a single scout at a time
-                if game_state.turn_number % 2 == 1:
-                    # To simplify we will just check sending them from back left and right
-                    scout_spawn_location_options = [[13, 0], [14, 0]]
-                    best_location = self.least_damage_spawn_location(game_state, scout_spawn_location_options)
-                    game_state.attempt_spawn(SCOUT, best_location, 1000)
-
-                # Lastly, if we have spare SP, let's build some Factories to generate more resources
-                support_locations = [[13, 2], [14, 2], [13, 3], [14, 3]]
-                game_state.attempt_spawn(SUPPORT, support_locations)
-
-    def init_defences(self, game_state):
-        """
-        Build basic defenses using hardcoded locations.
-        Remember to defend corners and avoid placing units in the front where enemy demolishers can attack them.
-        """
-        # Useful tool for setting up your base locations: https://www.kevinbai.design/terminal-map-maker
-        # More community tools available at: https://terminal.c1games.com/rules#Download
-
-
-        # Place turrets that attack enemy units
-        turret_locations = [[3, 12], [8, 12], [19, 12], [24, 12], [13, 11], [14, 11]]
-        # attempt_spawn will try to spawn units if we have resources, and will check if a blocking unit is already there
-        game_state.attempt_spawn(TURRET, turret_locations)
-        
-        # Place walls in front of turrets to soak up damage for them
-        wall_locations = [[0, 13], [1, 13], [2, 13], [3, 13], [8, 13], [19, 13], [24, 13], [25, 13], [26, 13], [27, 13], [7, 12], [9, 12], [12, 12], [13, 12], [14, 12], [15, 12], [18, 12], [20, 12]]
-        game_state.attempt_spawn(WALL, wall_locations)
-
-    def build_reactive_defense(self, game_state):
-        """
-        This function builds reactive defenses based on where the enemy scored on us from.
-        We can track where the opponent scored by looking at events in action frames 
-        as shown in the on_action_frame function
-        """
-        
-        for location in self.scored_on_locations:
-            # Build turret one space above so that it doesn't block our own edge spawn locations
-            build_location = [location[0], location[1]+1]
-            game_state.attempt_spawn(TURRET, build_location)
-
-    def stall_with_interceptors(self, game_state):
-        """
-        Send out interceptors at random locations to defend our base from enemy moving units.
-        """
-        # We can spawn moving units on our edges so a list of all our edge locations
-        friendly_edges = game_state.game_map.get_edge_locations(game_state.game_map.BOTTOM_LEFT) + game_state.game_map.get_edge_locations(game_state.game_map.BOTTOM_RIGHT)
-        
-        # Remove locations that are blocked by our own structures 
-        # since we can't deploy units there.
-        deploy_locations = self.filter_blocked_locations(friendly_edges, game_state)
-        
-        # While we have remaining MP to spend lets send out interceptors randomly.
-        while game_state.get_resource(MP) >= game_state.type_cost(INTERCEPTOR)[MP] and len(deploy_locations) > 0:
-            # Choose a random deploy location.
-            deploy_index = random.randint(0, len(deploy_locations) - 1)
-            deploy_location = deploy_locations[deploy_index]
-            
-            game_state.attempt_spawn(INTERCEPTOR, deploy_location)
-            """
-            We don't have to remove the location since multiple mobile 
-            units can occupy the same space.
-            """
-
-    def demolisher_line_strategy(self, game_state):
-        """
-        Build a line of the cheapest stationary unit so our demolisher can attack from long range.
-        """
-        # First let's figure out the cheapest unit
-        # We could just check the game rules, but this demonstrates how to use the GameUnit class
-        stationary_units = [WALL, TURRET, SUPPORT]
-        cheapest_unit = WALL
-        for unit in stationary_units:
-            unit_class = gamelib.GameUnit(unit, game_state.config)
-            if unit_class.cost[game_state.MP] < gamelib.GameUnit(cheapest_unit, game_state.config).cost[game_state.MP]:
-                cheapest_unit = unit
-
-        # Now let's build out a line of stationary units. This will prevent our demolisher from running into the enemy base.
-        # Instead they will stay at the perfect distance to attack the front two rows of the enemy base.
-        for x in range(27, 5, -1):
-            game_state.attempt_spawn(cheapest_unit, [x, 11])
-
-        # Now spawn demolishers next to the line
-        # By asking attempt_spawn to spawn 1000 units, it will essentially spawn as many as we have resources for
-        game_state.attempt_spawn(DEMOLISHER, [24, 10], 1000)
-
-    def least_damage_spawn_location(self, game_state, location_options):
-        """
-        This function will help us guess which location is the safest to spawn moving units from.
-        It gets the path the unit will take then checks locations on that path to 
-        estimate the path's damage risk.
-        """
-        damages = []
-        # Get the damage estimate each path will take
-        for location in location_options:
-            path = game_state.find_path_to_edge(location)
-            damage = 0
-            for path_location in path:
-                # Get number of enemy turrets that can attack each location and multiply by turret damage
-                damage += len(game_state.get_attackers(path_location, 0)) * gamelib.GameUnit(TURRET, game_state.config).damage_i
-            damages.append(damage)
-        
-        # Now just return the location that takes the least damage
-        return location_options[damages.index(min(damages))]
-    
-    def detect_enemy_unit(self, game_state, unit_type=None, valid_x = None, valid_y = None):
-        total_units = 0
-        for location in game_state.game_map:
-            if game_state.contains_stationary_unit(location):
-                for unit in game_state.game_map[location]:
-                    if unit.player_index == 1 and (unit_type is None or unit.unit_type == unit_type) and (valid_x is None or location[0] in valid_x) and (valid_y is None or location[1] in valid_y):
-                        total_units += 1
-        return total_units
-        
-    def filter_blocked_locations(self, locations, game_state):
-        filtered = []
-        for location in locations:
-            if not game_state.contains_stationary_unit(location):
-                filtered.append(location)
-        return filtered
-
-    
